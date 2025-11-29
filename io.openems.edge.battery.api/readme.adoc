@@ -1,3 +1,202 @@
-= Battery
+# OpenEMS Edge Battery API 分析
 
-A battery that is connected to a battery inverter.
+## 概述
+
+`io.openems.edge.battery.api` 是 OpenEMS (Open Energy Management System) 项目中专门用于电池管理的 API 模块。该模块定义了电池组件的通用接口、保护机制、以及电池管理的核心逻辑。
+
+## 目录结构分析
+
+```
+io.openems.edge.battery.api/
+├── src/io/openems/edge/battery/
+│   ├── api/                              # 核心 API 接口
+│   │   ├── Battery.java                 # 电池主接口定义
+│   │   ├── BatteryErrorAcknowledge.java  # 电池错误确认接口
+│   │   └── package-info.java
+│   ├── protection/                       # 电池保护机制
+│   │   ├── BatteryProtection.java        # 电池保护核心逻辑
+│   │   ├── BatteryProtectionDefinition.java # 电池保护配置接口
+│   │   ├── BatteryVoltageProtection.java # 电压保护
+│   │   ├── BatteryVoltageProtectionLimits.java # 电压保护限制
+│   │   ├── currenthandler/              # 电流处理器
+│   │   │   ├── AbstractMaxCurrentHandler.java # 抽象最大电流处理器
+│   │   │   ├── ChargeMaxCurrentHandler.java # 充电最大电流处理器
+│   │   │   ├── DischargeMaxCurrentHandler.java # 放电最大电流处理器
+│   │   │   └── package-info.java
+│   │   ├── force/                        # 强制充放电
+│   │   │   ├── AbstractForceChargeDischarge.java # 抽象强制充放电类
+│   │   │   ├── ForceCharge.java          # 强制充电
+│   │   │   ├── ForceDischarge.java       # 强制放电
+│   │   │   └── package-info.java
+│   │   └── readme.adoc                   # 保护机制说明文档
+│   └── test/                             # 测试工具类
+│       ├── AbstractDummyBattery.java     # 抽象虚拟电池
+│       ├── DummyBattery.java             # 虚拟电池实现
+│       └── package-info.java
+├── doc/                                  # 文档目录
+│   └── forcecharge-statemachine.md      # 强制充电状态机文档
+└── test/                                 # 单元测试
+    └── io/openems/edge/battery/protection/
+```
+
+## 核心组件功能分析
+
+### 1. Battery.java - 电池核心接口
+
+**主要功能：**
+- 定义电池的通用数据通道和操作接口
+- 提供电池状态监控（SOC、SOH、电压、电流等）
+- 定义充放电限制参数
+- 支持 Modbus TCP 通信接口
+
+**关键数据通道：**
+- `SOC`: 充电状态 (0-100%)
+- `SOH`: 健康状态 (0-100%)
+- `VOLTAGE`: 电池电压 (V)
+- `CURRENT`: 电池电流 (A)
+- `CAPACITY`: 电池容量 (Wh)
+- `CHARGE_MAX_VOLTAGE`: 充电最大电压 (V)
+- `CHARGE_MAX_CURRENT`: 充电最大电流 (A)
+- `DISCHARGE_MIN_VOLTAGE`: 放电最小电压 (V)
+- `DISCHARGE_MAX_CURRENT`: 放电最大电流 (A)
+- 温度相关通道：`MIN_CELL_TEMPERATURE`, `MAX_CELL_TEMPERATURE`
+- 电芯电压：`MIN_CELL_VOLTAGE`, `MAX_CELL_VOLTAGE`
+- `INNER_RESISTANCE`: 内阻 (mOhm)
+
+**设计模式：**
+- 使用构建器模式提供 Modbus 接口
+- 为每个数据通道提供 getter/setter 方法
+- 内部使用 `_setXxx()` 方法设置下一值
+
+### 2. BatteryProtection.java - 电池保护机制
+
+**核心功能：**
+- 计算允许的最大充电和放电电流
+- 实现多维度电池保护策略
+- 集成电流处理器、电压保护、温度保护等
+
+**保护维度：**
+1. **BMS 限制**：电池管理系统提供的电流限制
+2. **电压保护**：基于电芯最小/最大电压的限制
+3. **温度保护**：基于电芯温度的限制
+4. **SOC 保护**：基于充电状态的保护
+5. **电流增长率限制**：防止电流突变的安全机制
+6. **强制充放电模式**：特殊工作模式
+
+**算法逻辑：**
+```java
+// 计算最终电流限制的逻辑
+var limit = TypeUtils.min(
+    BMS限制,
+    最小电芯电压限制,
+    最大电芯电压限制,
+    最小电芯温度限制,
+    最大电芯温度限制,
+    SOC限制,
+    电流增长率限制,
+    强制充放电电流
+);
+```
+
+### 3. AbstractMaxCurrentHandler.java - 电流处理器抽象类
+
+**主要功能：**
+- 实现电流限制计算的核心算法
+- 管理电流增长的斜坡控制
+- 处理各种保护条件的计算
+
+**关键算法特性：**
+- **电压百分比特性**：使用 PolyLine 定义电压-百分比映射关系
+- **温度百分比特性**：温度-百分比映射
+- **SOC百分比特性**：充电状态-百分比映射
+- **增长率限制**：防止电流过快增长，保护电池安全
+- **状态记忆**：电压限制激活后只能逐步放松，避免频繁波动
+
+### 4. AbstractForceChargeDischarge.java - 强制充放电状态机
+
+**状态定义：**
+- `UNDEFINED`: 未定义状态
+- `WAIT_FOR_FORCE_MODE`: 等待强制模式（60秒计时）
+- `FORCE_MODE`: 强制模式（强制充电-2A）
+- `BLOCK_MODE`: 阻塞模式（0A，禁止操作）
+
+**状态转换逻辑：**
+- 基于电芯电压阈值进行状态切换
+- 使用状态机模式实现状态管理
+- 支持超时机制和条件判断
+
+### 5. BatteryErrorAcknowledge.java - 错误确认接口
+
+**功能：**
+- 管理电池启动/停止超时错误
+- 提供错误状态重置机制
+- 支持错误确认和清除操作
+
+## 架构设计特点
+
+### 1. 模块化设计
+- 清晰的功能分层：API接口 → 保护机制 → 具体实现
+- 每个组件职责单一，易于维护和扩展
+- 支持插件式的保护策略
+
+### 2. 安全性设计
+- 多层保护机制确保电池安全
+- 渐进式电流限制，避免突然变化
+- 温度、电压、SOC等多维度监控
+- BMS数据作为安全底线
+
+### 3. 灵活性设计
+- 通过 PolyLine 支持自定义保护曲线
+- 可配置的增长率限制
+- 支持强制充放电等特殊模式
+- 提供测试用的虚拟电池实现
+
+### 4. 可观测性设计
+- 丰富的调试通道记录中间计算结果
+- 完整的状态监控和日志记录
+- 支持 Modbus 便于系统集成和监控
+
+## 使用方式
+
+### 1. 基本集成
+```java
+// 1. 实现 Battery 接口
+public class MyBattery implements Battery {
+    // 实现所有必要的方法
+}
+
+// 2. 配置电池保护
+BatteryProtection protection = BatteryProtection.create(battery)
+    .applyBatteryProtectionDefinition(protectionDef, clockProvider)
+    .build();
+
+// 3. 在周期中应用保护逻辑
+protection.apply();
+```
+
+### 2. 测试支持
+使用 `DummyBattery` 类进行单元测试和集成测试，无需真实硬件。
+
+### 3. 调试和监控
+通过 `BatteryProtection.ChannelId` 定义的调试通道监控保护算法的运行状态。
+
+## 设计优势
+
+1. **安全性**：多层保护机制，有效防止电池过充、过放、过温等情况
+2. **可靠性**：渐进式保护和状态记忆机制，避免频繁波动
+3. **可扩展性**：模块化设计支持自定义保护策略
+4. **易用性**：提供清晰的接口和完整的文档
+5. **可测试性**：内置测试工具类，便于单元测试
+
+## 应用场景
+
+该 API 主要用于：
+- 电池储能系统的管理控制
+- 电动汽车电池管理系统
+- 可再生能源储能应用
+- 微电网和智能电网系统
+- 工业电池监控系统
+
+---
+
+*此文档基于对 io.openems.edge.battery.api 模块的源码分析生成，详细说明了各个组件的功能、架构设计和使用方式。*
